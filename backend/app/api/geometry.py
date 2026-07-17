@@ -8,6 +8,7 @@ from app.api.deps import get_entry
 from app.models.schemas import (
     CreateBeamRequest,
     CreateColumnRequest,
+    CreateRoofRequest,
     CreateSlabRequest,
     CreateWallGeomRequest,
     EditDimensionsRequest,
@@ -90,6 +91,42 @@ def create_beam(req: CreateBeamRequest, entry: ModelEntry = Depends(get_entry)):
     except RuntimeError as e:
         raise HTTPException(400, f"falha ao criar viga: {e}")
     return {"ok": True, "guid": beam.GlobalId, "id": beam.id()}
+
+
+@router.post("/roof")
+def create_roof(req: CreateRoofRequest, entry: ModelEntry = Depends(get_entry)):
+    try:
+        roof, params = geo.create_roof(
+            entry,
+            name=req.name,
+            faces=[
+                {
+                    "vertices": face.vertices,
+                    "edge_index": face.edge_index,
+                    "angle_deg": face.angle_deg,
+                }
+                for face in req.faces
+            ],
+            base_z=req.base_z,
+            thickness=req.thickness,
+            pitch_min_deg=req.pitch_min_deg,
+            pitch_max_deg=req.pitch_max_deg,
+            storey_guid=req.storey_guid,
+            description=req.description,
+            object_type=req.object_type,
+            tag=req.tag,
+            predefined_type=req.predefined_type,
+            reference=req.reference,
+            status=req.status,
+            acoustic_rating=req.acoustic_rating,
+            fire_rating=req.fire_rating,
+            is_external=req.is_external,
+            thermal_transmittance=req.thermal_transmittance,
+            load_bearing=req.load_bearing,
+        )
+    except (RuntimeError, ValueError) as e:
+        raise HTTPException(400, f"falha ao criar telhado: {e}")
+    return {"ok": True, "guid": roof.GlobalId, "id": roof.id(), "params": params}
 
 
 @router.post("/placement")

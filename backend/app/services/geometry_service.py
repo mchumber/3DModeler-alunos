@@ -306,6 +306,194 @@ def translate_product(entry: ModelEntry, guid: str, delta) -> None:
     transform_product(entry, guid, translate=delta)
 
 
+def _polygon_area_3d(verts: list[list[float]]) -> float:
+    """Área de um polígono plano 3D (método de Newell)."""
+    n = len(verts)
+    if n < 3:
+        return 0.0
+    normal = np.zeros(3)
+    for i in range(n):
+        a = np.array(verts[i], dtype=float)
+        b = np.array(verts[(i + 1) % n], dtype=float)
+        normal += np.cross(a, b)
+    return float(np.linalg.norm(normal)) / 2.0
+
+
+def _polygon_area_xy(verts: list[list[float]]) -> float:
+    """Área projetada no plano XY (shoelace)."""
+    n = len(verts)
+    if n < 3:
+        return 0.0
+    s = 0.0
+    for i in range(n):
+        a, b = verts[i], verts[(i + 1) % n]
+        s += a[0] * b[1] - b[0] * a[1]
+    return abs(s) / 2.0
+
+
+def create_roof(
+    entry: ModelEntry,
+    name: str | None,
+    faces: list[dict],
+    base_z: float = 0.0,
+    thickness: float = 0.1,
+    pitch_min_deg: float | None = None,
+    pitch_max_deg: float | None = None,
+    storey_guid: str | None = None,
+    # atributos IfcRoof (IFC4x3)
+    description: str | None = None,
+    object_type: str | None = None,
+    tag: str | None = None,
+    predefined_type: str = "FREEFORM",
+    # Pset_RoofCommon (IFC4x3)
+    reference: str | None = None,
+    status: str | None = None,
+    acoustic_rating: str | None = None,
+    fire_rating: str | None = None,
+    is_external: bool = True,
+    thermal_transmittance: float | None = None,
+    load_bearing: bool = False,
+) -> tuple[ifcopenshell.entity_instance, dict]:
+    """Cria um IfcRoof com geometria baseada em faces planares (IfcShellBasedSurfaceModel).
+
+    Cada entrada em `faces` é um dict com:
+        vertices: [[x,y,z], ...]  — polígono plano da face (mínimo 3 pontos, metros)
+        edge_index: int
+        angle_deg: float
+
+    A representação usa IfcOpenShell (superfície aberta) para que ferramentas
+    IFC como BIMVision e Revit consigam visualizar o telhado sem solid-boolean.
+
+    Atributos e psets seguem o IFC4x3:
+      - IfcRoof.PredefinedType   (IfcRoofTypeEnum)
+      - Pset_RoofCommon          (Reference, Status, AcousticRating, FireRating,
+                                  IsExternal, ThermalTransmittance, LoadBearing)
+      - Qto_RoofBaseQuantities   (GrossArea, NetArea, ProjectedArea)
+
+    Retorna (roof, params) onde `params` é um dicionário com todos os
+    parâmetros IFC efetivamente gravados (para exibição na UI).
+    """
+    with mutate(entry) as f:
+        body = get_body_context(f)
+        scale = ifcopenshell.util.unit.calculate_unit_scale(f)  # file unit → m
+
+        def pt(xyz):
+            return f.create_entity(
+                "IfcCartesianPoint",
+                Coordinates=[float(xyz[0]) / scale, float(xyz[1]) / scale, float(xyz[2]) / scale],
+            )
+
+        ifc_faces = []
+        for face_data in faces:
+            verts = face_data["vertices"]
+            if len(verts) < 3:
+                continue
+            ifc_pts = [pt(v) for v in verts]
+            poly_loop = f.create_entity("IfcPolyLoop", Polygon=ifc_pts)
+            outer_bound = f.create_entity("IfcFaceOuterBound", Bound=poly_loop, Orientation=True)
+            ifc_faces.append(f.create_entity("IfcFace", Bounds=[outer_bound]))
+
+        if not ifc_faces:
+            raise ValueError("Nenhuma face válida para o telhado (mínimo 3 vértices por face).")
+
+        shell = f.create_entity("IfcOpenShell", CfsFaces=ifc_faces)
+        surface_model = f.create_entity("IfcShellBasedSurfaceModel", SbsmBoundary=[shell])
+
+        rep = f.create_entity(
+            "IfcShapeRepresentation",
+            ContextOfItems=body,
+            RepresentationIdentifier="Body",
+            RepresentationType="SurfaceModel",
+            Items=[surface_model],
+        )
+        product_rep = f.create_entity("IfcProductDefinitionShape", Representations=[rep])
+
+        roof = ifcopenshell.api.run(
+            "root.create_entity",
+            f,
+            ifc_class="IfcRoof",
+            name=name or "Telhado",
+        )
+        roof.Representation = product_rep
+
+        # ── Atributos IfcRoof (IFC4x3) ───────────────────────────────────────
+        if description:
+            roof.Description = description
+        if tag:
+            roof.Tag = tag
+        ptype = (predefined_type or "FREEFORM").upper()
+        try:
+            roof.PredefinedType = ptype
+        except Exception:
+            ptype = "NOTDEFINED"
+        # ObjectType só é normativo quando PredefinedType = USERDEFINED
+        if object_type:
+            roof.ObjectType = object_type
+
+        place_product(f, roof, matrix_from((0.0, 0.0, base_z)), storey_guid)
+
+        angles = [face_data.get("angle_deg", 0) for face_data in faces]
+        p_min = pitch_min_deg if pitch_min_deg is not None else (min(angles) if angles else 0)
+        p_max = pitch_max_deg if pitch_max_deg is not None else (max(angles) if angles else 0)
+
+        def _add_pset(pset_name: str, properties: dict):
+            props = {k: v for k, v in properties.items() if v is not None}
+            if not props:
+                return
+            pset = ifcopenshell.api.run("pset.add_pset", f, product=roof, name=pset_name)
+            ifcopenshell.api.run("pset.edit_pset", f, pset=pset, properties=props)
+
+        # ── Pset_RoofCommon (IFC4x3 oficial + extras de inclinação) ────────
+        pset_common = {
+            "Reference": reference,
+            "Status": status,
+            "AcousticRating": acoustic_rating,
+            "FireRating": fire_rating,
+            "IsExternal": bool(is_external),
+            "ThermalTransmittance": float(thermal_transmittance) if thermal_transmittance is not None else None,
+            "LoadBearing": bool(load_bearing),
+            # extras não normativos (compatibilidade com a UI de inclinação)
+            "PitchAngle": float(angles[0]) if angles else None,
+            "PitchAngleMin": float(p_min),
+            "PitchAngleMax": float(p_max),
+            "NumberOfPitches": len(ifc_faces),
+            "Thickness": float(thickness),
+        }
+        try:
+            _add_pset("Pset_RoofCommon", pset_common)
+        except Exception:
+            pass  # Pset não crítico; não deve interromper a criação
+
+        # ── Qto_RoofBaseQuantities (IFC4x3) ─────────────────────────────────
+        gross_area = sum(_polygon_area_3d(fd["vertices"]) for fd in faces)
+        projected_area = sum(_polygon_area_xy(fd["vertices"]) for fd in faces)
+        qto = {
+            "GrossArea": round(gross_area, 4),
+            "NetArea": round(gross_area, 4),       # sem aberturas → Net = Gross
+            "ProjectedArea": round(projected_area, 4),
+        }
+        try:
+            qset = ifcopenshell.api.run(
+                "pset.add_qto", f, product=roof, name="Qto_RoofBaseQuantities"
+            )
+            ifcopenshell.api.run("pset.edit_qto", f, qto=qset, properties=qto)
+        except Exception:
+            pass  # Qto não crítico
+
+        params = {
+            "GlobalId": roof.GlobalId,
+            "Name": roof.Name,
+            "Description": description,
+            "ObjectType": object_type,
+            "Tag": tag,
+            "PredefinedType": ptype,
+            "Pset_RoofCommon": {k: v for k, v in pset_common.items() if v is not None},
+            "Qto_RoofBaseQuantities": qto,
+        }
+
+    return roof, params
+
+
 def edit_wall_dimensions(
     entry: ModelEntry,
     guid: str,

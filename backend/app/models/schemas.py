@@ -1,6 +1,6 @@
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CreateModelRequest(BaseModel):
@@ -153,3 +153,60 @@ class GridRequest(BaseModel):
     u: list[GridAxisU] = Field(default_factory=list)
     v: list[GridAxisV] = Field(default_factory=list)
     extent: float | None = None  # meia-largura das linhas (m); auto se None
+
+
+# ----- telhado (IfcRoof) -----
+
+# IfcRoofTypeEnum — IFC4x3
+# https://ifc43-docs.standards.buildingsmart.org/IFC/RELEASE/IFC4x3/HTML/lexical/IfcRoofTypeEnum.htm
+ROOF_TYPE_ENUM = {
+    "FLAT_ROOF", "SHED_ROOF", "GABLE_ROOF", "HIP_ROOF", "HIPPED_GABLE_ROOF",
+    "GAMBREL_ROOF", "MANSARD_ROOF", "BARREL_ROOF", "RAINBOW_ROOF",
+    "BUTTERFLY_ROOF", "PAVILION_ROOF", "DOME_ROOF", "FREEFORM",
+    "USERDEFINED", "NOTDEFINED",
+}
+
+
+class RoofFace(BaseModel):
+    """Uma face planar do telhado definida por seus vértices 3D (metros, Z-up)."""
+    vertices: list[list[float]] = Field(min_length=3)
+    edge_index: int = 0
+    angle_deg: float = 30.0
+
+
+class CreateRoofRequest(BaseModel):
+    name: str | None = None
+    faces: list[RoofFace] = Field(min_length=1)
+    footprint: list[list[float]] | None = None  # [[x,y,z], ...] contorno original
+    base_z: float = 0.0                          # Z da base (beiral mais baixo)
+    storey_guid: str | None = None
+
+    # ── Atributos IfcRoof (IFC4x3) ────────────────────────────────────────────
+    description: str | None = None               # IfcRoot.Description
+    object_type: str | None = None               # IfcObject.ObjectType (se USERDEFINED)
+    tag: str | None = None                       # IfcElement.Tag
+    predefined_type: str = "FREEFORM"            # IfcRoofTypeEnum
+
+    # ── Pset_RoofCommon (IFC4x3) ─────────────────────────────────────────────
+    reference: str | None = None                 # Reference (IfcIdentifier)
+    status: str | None = None                    # NEW | EXISTING | DEMOLISH | TEMPORARY
+    acoustic_rating: str | None = None           # AcousticRating (IfcLabel)
+    fire_rating: str | None = None               # FireRating (IfcLabel)
+    is_external: bool = True                     # IsExternal (IfcBoolean)
+    thermal_transmittance: float | None = None   # ThermalTransmittance (W/m²K)
+    load_bearing: bool = False                   # LoadBearing (IfcBoolean)
+
+    # ── extras de inclinação (não normativos, mantidos p/ compat.) ──────────
+    pitch_min_deg: float | None = None           # ângulo mínimo entre as faces
+    pitch_max_deg: float | None = None           # ângulo máximo entre as faces
+    thickness: float = 0.1                       # espessura do telhado (m)
+
+    @field_validator("predefined_type")
+    @classmethod
+    def _validate_predefined_type(cls, v: str) -> str:
+        v = (v or "FREEFORM").upper()
+        if v not in ROOF_TYPE_ENUM:
+            raise ValueError(
+                f"predefined_type inválido: {v!r}. Valores: {sorted(ROOF_TYPE_ENUM)}"
+            )
+        return v
